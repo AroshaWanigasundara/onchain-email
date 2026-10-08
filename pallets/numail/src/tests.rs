@@ -58,6 +58,7 @@ fn mail_item_can_be_stored_indexed_and_delivered() {
 			sender: 1,
 			recipients: BoundedVec::try_from(vec![2]).unwrap(),
 			subject_hash: Default::default(),
+			encrypted_subject: BoundedVec::default(),
 			body_ref: Default::default(),
 			encrypted_body: BoundedVec::default(),
 			attachments: BoundedVec::default(),

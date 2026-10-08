@@ -241,6 +241,11 @@ pub mod pallet {
 		/// - Storage buffer: 2048 bytes allows for future key sizes
 		#[pallet::constant]
 		type MaxPublicKeyLen: Get<u32>;
+
+		/// Maximum byte length of an encrypted subject line:
+		/// nonce (12) || ciphertext || tag (16). 512 bytes is plenty for a subject.
+		#[pallet::constant]
+		type MaxEncryptedSubjectLen: Get<u32>;
 	}
 
 	/// A folder or label name within a mailbox (e.g. "inbox", "sent", "archive", or a custom
@@ -364,6 +369,9 @@ pub mod pallet {
 		pub recipients: BoundedVec<T::AccountId, T::MaxRecipients>,
 		/// Hash of the (client-side) subject line.
 		pub subject_hash: T::Hash,
+		/// AES-256-GCM encrypted subject: nonce (12) || ciphertext || tag (16).
+		/// Decrypted with the same AES key as the body.
+		pub encrypted_subject: BoundedVec<u8, <T as Config>::MaxEncryptedSubjectLen>,
 		/// Legacy field: Hash reference (may be used for off-chain indexing). 
 		/// Note: The actual body is now in `encrypted_body` (on-chain).
 		pub body_ref: T::Hash,
@@ -613,6 +621,8 @@ pub mod pallet {
 		PublicKeyTooLarge,
 		/// No public key was provided at mailbox creation.
 		PublicKeyRequired,
+		/// The encrypted subject exceeds [`Config::MaxEncryptedSubjectLen`].
+		EncryptedSubjectTooLarge,
 	}
 
 	#[pallet::call]
@@ -766,7 +776,7 @@ pub mod pallet {
 		pub fn send_mail(
 			origin: OriginFor<T>,
 			recipients: Vec<T::AccountId>,
-			subject_hash: T::Hash,
+			encrypted_subject: Vec<u8>, 
 			encrypted_body: Vec<u8>,
 			encrypted_keys: Vec<(T::AccountId, Vec<u8>)>,
 			attachments: Vec<T::Hash>,
@@ -787,6 +797,18 @@ pub mod pallet {
 					Error::<T>::AttachmentNotAnchored
 				);
 			}
+
+			// Validate encrypted subject length
+			let encrypted_subject_bounded: BoundedVec<u8, T::MaxEncryptedSubjectLen> =
+				encrypted_subject
+					.try_into()
+					.map_err(|_| Error::<T>::EncryptedSubjectTooLarge)?;
+
+			// Hash the ciphertext on-chain so the hash can never disagree with the stored subject
+			let subject_hash = {
+				use frame_support::sp_runtime::traits::Hash as HashT;
+				T::Hashing::hash(&encrypted_subject_bounded)
+			};
 
 			// Validate encrypted_body length
 			let encrypted_body_bounded: BoundedVec<u8, T::MaxEncryptedBodyLen> = encrypted_body
@@ -862,6 +884,7 @@ pub mod pallet {
 				sender.clone(),
 				recipients.clone(),
 				subject_hash,
+				encrypted_subject_bounded,
 				encrypted_body_bounded,
 				bounded_encrypted_keys,
 				attachments,
@@ -1056,6 +1079,7 @@ pub mod pallet {
 			sender: T::AccountId,
 			recipients: BoundedVec<T::AccountId, T::MaxRecipients>,
 			subject_hash: T::Hash,
+			encrypted_subject: BoundedVec<u8, T::MaxEncryptedSubjectLen>,
 			encrypted_body: BoundedVec<u8, T::MaxEncryptedBodyLen>,
 			encrypted_keys: Vec<(T::AccountId, BoundedVec<u8, T::MaxEncryptedKeyLen>)>,
 			attachments: BoundedVec<T::Hash, T::MaxAttachments>,
@@ -1077,6 +1101,7 @@ pub mod pallet {
 				sender: sender.clone(),
 				recipients: recipients.clone(),
 				subject_hash,
+				encrypted_subject,
 				body_ref: T::Hash::default(), // Legacy field (no longer used for actual body)
 				encrypted_body,
 				attachments,
@@ -1149,6 +1174,7 @@ pub mod pallet {
 				sender,
 				recipients,
 				subject_hash,
+				BoundedVec::default(),
 				empty_encrypted_body,
 				empty_encrypted_keys,
 				BoundedVec::default(),

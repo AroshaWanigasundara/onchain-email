@@ -712,12 +712,16 @@ fn system_notice_works_via_root() {
 		System::set_block_number(1);
 		open_mailbox(2);
 
+		let encrypted_key = mock_encrypted_key(256);
+
 		assert_ok!(NuMail::system_notice(
 			RuntimeOrigin::root(),
 			99, // notice sender, e.g. a pallet account
 			vec![2],
 			Default::default(),
-			Default::default(),
+			vec![],
+			vec![(2, encrypted_key)],
+			None,
 		));
 
 		let mail_id = 0u64;
@@ -733,13 +737,18 @@ fn system_notice_works_via_root() {
 fn system_notice_fails_for_signed_origin() {
 	new_test_ext().execute_with(|| {
 		open_mailbox(2);
+
+		let encrypted_key = mock_encrypted_key(256);
+
 		assert_noop!(
 			NuMail::system_notice(
 				RuntimeOrigin::signed(1),
 				99,
 				vec![2],
 				Default::default(),
-				Default::default(),
+				vec![],
+				vec![(2, encrypted_key)],
+				None,
 			),
 			sp_runtime::DispatchError::BadOrigin
 		);
@@ -749,13 +758,18 @@ fn system_notice_fails_for_signed_origin() {
 #[test]
 fn system_notice_fails_without_recipient_mailbox() {
 	new_test_ext().execute_with(|| {
+
+		let encrypted_key = mock_encrypted_key(256);
+
 		assert_noop!(
 			NuMail::system_notice(
 				RuntimeOrigin::root(),
 				99,
 				vec![2],
 				Default::default(),
-				Default::default(),
+				vec![],
+				vec![(2, encrypted_key)],
+				None,
 			),
 			Error::<Test>::MailboxNotFound
 		);
@@ -774,13 +788,17 @@ fn system_notice_bypasses_acceptance_policy() {
 			mock_public_key(256),
 		));
 
+		let encrypted_key = mock_encrypted_key(256);
+
 		// ...still gets through via the privileged system_notice pathway.
 		assert_ok!(NuMail::system_notice(
 			RuntimeOrigin::root(),
 			99,
 			vec![2],
 			Default::default(),
-			Default::default(),
+			vec![],
+			vec![(2, encrypted_key)],
+			None,
 		));
 	});
 }
@@ -791,7 +809,8 @@ fn deliver_system_notice_can_be_called_directly() {
 	// all — the "pallet-internal" half of the spec's "Root / pallet-internal" origin.
 	new_test_ext().execute_with(|| {
 		open_mailbox(2);
-		assert_ok!(NuMail::deliver_system_notice(99, vec![2], Default::default(), Default::default()));
+		let encrypted_key = mock_encrypted_key(256);
+		assert_ok!(NuMail::deliver_system_notice(99, vec![2], Default::default(), vec![], vec![(2, encrypted_key)], None,));
 		assert_eq!(DeliveryState::<Test>::get(0u64, 2), Some(DeliveryStatus::Delivered));
 	});
 }

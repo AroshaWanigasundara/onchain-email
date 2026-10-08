@@ -175,6 +175,7 @@ parameter_types! {
 	pub const MaxEncryptedBodyLen: u32 = 65536;  // 64 KB max encrypted body
     pub const MaxEncryptedKeyLen: u32 = 2048;
 	pub const MaxPublicKeyLen: u32 = 2048;  // 2 KB for RSA public key
+	pub const MaxEncryptedSubjectLen: u32 = 2048;
 }
  
 /// Configure the pallet-numail in pallets/numail.
@@ -197,4 +198,5 @@ impl pallet_numail::Config for Runtime {
 	type MaxEncryptedBodyLen = MaxEncryptedBodyLen;
     type MaxEncryptedKeyLen = MaxEncryptedKeyLen;
 	type MaxPublicKeyLen = MaxPublicKeyLen;
+	type MaxEncryptedSubjectLen = MaxEncryptedSubjectLen;
 }

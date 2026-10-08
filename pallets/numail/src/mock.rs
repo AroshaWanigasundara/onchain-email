@@ -146,6 +146,7 @@ parameter_types! {
     pub const MaxEncryptedBodyLen: u32 = 65536;  // 64 KB max encrypted body
     pub const MaxEncryptedKeyLen: u32 = 2048;     // 2 KB max (RSA-4096)
 	pub const MaxPublicKeyLen: u32 = 2048;  // 2 KB for RSA public key
+	pub const MaxEncryptedSubjectLen: u32 = 2048;
 }
 
 impl pallet_numail::Config for Test {
@@ -165,6 +166,7 @@ impl pallet_numail::Config for Test {
 	type MaxEncryptedBodyLen = MaxEncryptedBodyLen;
     type MaxEncryptedKeyLen = MaxEncryptedKeyLen;
 	type MaxPublicKeyLen = MaxPublicKeyLen;
+	type MaxEncryptedSubjectLen = MaxEncryptedSubjectLen;
 }
 
 // Build genesis storage according to the mock runtime.

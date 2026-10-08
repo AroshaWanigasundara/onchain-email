@@ -155,6 +155,14 @@ pub mod pallet {
 		}
 	}
 
+	/// Bounded, validated encryption payload shared by `send_mail` and `system_notice`.
+	pub struct BoundedMailPayload<T: Config> {
+		pub subject_hash: T::Hash,
+		pub encrypted_subject: BoundedVec<u8, T::MaxEncryptedSubjectLen>,
+		pub encrypted_body: BoundedVec<u8, T::MaxEncryptedBodyLen>,
+		pub encrypted_keys: Vec<(T::AccountId, BoundedVec<u8, T::MaxEncryptedKeyLen>)>,
+	}
+
 	// The `Pallet` struct serves as a placeholder to implement traits, methods and dispatchables
 	// (`Call`s) in this pallet.
 	#[pallet::pallet]
@@ -798,50 +806,9 @@ pub mod pallet {
 				);
 			}
 
-			// Validate encrypted subject length
-			let encrypted_subject_bounded: BoundedVec<u8, T::MaxEncryptedSubjectLen> =
-				encrypted_subject
-					.try_into()
-					.map_err(|_| Error::<T>::EncryptedSubjectTooLarge)?;
-
-			// Hash the ciphertext on-chain so the hash can never disagree with the stored subject
-			let subject_hash = {
-				use frame_support::sp_runtime::traits::Hash as HashT;
-				T::Hashing::hash(&encrypted_subject_bounded)
-			};
-
-			// Validate encrypted_body length
-			let encrypted_body_bounded: BoundedVec<u8, T::MaxEncryptedBodyLen> = encrypted_body
-				.clone()
-				.try_into()
-				.map_err(|_| Error::<T>::EncryptedBodyTooLarge)?;
-
-			// Validate encrypted keys
-			// 1. Must have exactly one key per recipient
-			ensure!(
-				encrypted_keys.len() == recipients.len(),
-				Error::<T>::EncryptedKeyCountMismatch
-			);
-
-			// 2. Validate each encrypted key length and that recipient exists
-			let mut bounded_encrypted_keys: Vec<(T::AccountId, BoundedVec<u8, T::MaxEncryptedKeyLen>)> =
-				Vec::with_capacity(encrypted_keys.len());
-			
-			for (recipient, encrypted_key) in encrypted_keys.iter() {
-				// Ensure key is within bounds
-				let bounded_key: BoundedVec<u8, T::MaxEncryptedKeyLen> = encrypted_key
-					.clone()
-					.try_into()
-					.map_err(|_| Error::<T>::EncryptedKeyTooLarge)?;
-
-				// Ensure recipient is in the recipients list
-				ensure!(
-					recipients.contains(recipient),
-					Error::<T>::EncryptedKeyRecipientMismatch
-				);
-
-				bounded_encrypted_keys.push((recipient.clone(), bounded_key));
-			}
+			let payload = Self::validate_encrypted_payload(
+				&recipients, encrypted_subject, encrypted_body, encrypted_keys,
+			)?;
 
 			// Validate every recipient's mailbox and acceptance policy before writing anything
 			let mut required_postage: Option<PostageBalance> = None;
@@ -883,10 +850,10 @@ pub mod pallet {
 			let mail_id = Self::allocate_and_deliver(
 				sender.clone(),
 				recipients.clone(),
-				subject_hash,
-				encrypted_subject_bounded,
-				encrypted_body_bounded,
-				bounded_encrypted_keys,
+				payload.subject_hash,
+				payload.encrypted_subject,
+				payload.encrypted_body,
+				payload.encrypted_keys,
 				attachments,
 				thread_parent,
 			)?;
@@ -1062,11 +1029,16 @@ pub mod pallet {
 			origin: OriginFor<T>,
 			sender: T::AccountId,
 			recipients: Vec<T::AccountId>,
-			subject_hash: T::Hash,
-			body_ref: T::Hash,
+			encrypted_subject: Vec<u8>,
+			encrypted_body: Vec<u8>,
+			encrypted_keys: Vec<(T::AccountId, Vec<u8>)>,
+			thread_parent: Option<MailId>,
 		) -> DispatchResult {
 			T::SystemNoticeOrigin::ensure_origin(origin)?;
-			Self::deliver_system_notice(sender, recipients, subject_hash, body_ref)
+			Self::deliver_system_notice(
+				sender, recipients, encrypted_subject, encrypted_body, encrypted_keys, thread_parent,
+			)
+			.map(|_| ())
 		}
 		
 	}
@@ -1143,6 +1115,53 @@ pub mod pallet {
 			Ok(mail_id)
 		}
 
+		/// Validates subject/body/key sizes and the per-recipient key set.
+		fn validate_encrypted_payload(
+			recipients: &BoundedVec<T::AccountId, T::MaxRecipients>,
+			encrypted_subject: Vec<u8>,
+			encrypted_body: Vec<u8>,
+			encrypted_keys: Vec<(T::AccountId, Vec<u8>)>,
+		) -> Result<BoundedMailPayload<T>, DispatchError> {
+			let encrypted_subject: BoundedVec<u8, T::MaxEncryptedSubjectLen> = encrypted_subject
+				.try_into()
+				.map_err(|_| Error::<T>::EncryptedSubjectTooLarge)?;
+
+			// Hash the ciphertext on-chain so it can never disagree with the stored subject.
+			let subject_hash = {
+				use frame_support::sp_runtime::traits::Hash as HashT;
+				T::Hashing::hash(encrypted_subject.as_slice())
+			};
+
+			let encrypted_body: BoundedVec<u8, T::MaxEncryptedBodyLen> = encrypted_body
+				.try_into()
+				.map_err(|_| Error::<T>::EncryptedBodyTooLarge)?;
+
+			// Exactly one key per recipient
+			ensure!(
+				encrypted_keys.len() == recipients.len(),
+				Error::<T>::EncryptedKeyCountMismatch
+			);
+
+			let mut bounded_keys = Vec::with_capacity(encrypted_keys.len());
+			for (recipient, key) in encrypted_keys {
+				ensure!(recipients.contains(&recipient), Error::<T>::EncryptedKeyRecipientMismatch);
+				let key: BoundedVec<u8, T::MaxEncryptedKeyLen> =
+					key.try_into().map_err(|_| Error::<T>::EncryptedKeyTooLarge)?;
+				bounded_keys.push((recipient, key));
+			}
+
+			// Every recipient must actually have a key. Count equality alone is not enough:
+			// [(A,k),(A,k)] for recipients [A,B] passes the count check but leaves B with no key.
+			for recipient in recipients.iter() {
+				ensure!(
+					bounded_keys.iter().any(|(r, _)| r == recipient),
+					Error::<T>::EncryptedKeyRecipientMismatch
+				);
+			}
+
+			Ok(BoundedMailPayload { subject_hash, encrypted_subject, encrypted_body, encrypted_keys: bounded_keys })
+		}
+
 		/// The actual system-notice delivery logic, exposed as a plain function (not just via
 		/// the system_notice extrinsic) so another pallet that depends on pallet-numail
 		/// can call straight into it without going through origin-checked extrinsic dispatch.
@@ -1150,39 +1169,37 @@ pub mod pallet {
 		/// No attachments, threading, or encrypted bodies for system notices; they're standalone
 		/// privileged notifications by design.
 		pub fn deliver_system_notice(
-			sender: T::AccountId,
-			recipients: Vec<T::AccountId>,
-			subject_hash: T::Hash,
-			body_ref: T::Hash,
-		) -> DispatchResult {
-			ensure!(!recipients.is_empty(), Error::<T>::NoRecipients);
-			let recipients: BoundedVec<T::AccountId, T::MaxRecipients> =
-				recipients.try_into().map_err(|_| Error::<T>::TooManyRecipients)?;
+		sender: T::AccountId,
+		recipients: Vec<T::AccountId>,
+		encrypted_subject: Vec<u8>,
+		encrypted_body: Vec<u8>,
+		encrypted_keys: Vec<(T::AccountId, Vec<u8>)>,
+		thread_parent: Option<MailId>,
+	) -> Result<MailId, DispatchError> {
+		ensure!(!recipients.is_empty(), Error::<T>::NoRecipients);
+		let recipients: BoundedVec<T::AccountId, T::MaxRecipients> =
+			recipients.try_into().map_err(|_| Error::<T>::TooManyRecipients)?;
 
-			for recipient in recipients.iter() {
-				ensure!(Mailboxes::<T>::contains_key(recipient), Error::<T>::MailboxNotFound);
-			}
-
-			// System notices don't use encryption (privileged, governance notices are public)
-			// Create an empty encrypted body placeholder
-			let empty_encrypted_body: BoundedVec<u8, T::MaxEncryptedBodyLen> = BoundedVec::default();
-			
-			// No encrypted keys needed (system notices are not confidential)
-			let empty_encrypted_keys: Vec<(T::AccountId, BoundedVec<u8, T::MaxEncryptedKeyLen>)> = Vec::new();
-
-			Self::allocate_and_deliver(
-				sender,
-				recipients,
-				subject_hash,
-				BoundedVec::default(),
-				empty_encrypted_body,
-				empty_encrypted_keys,
-				BoundedVec::default(),
-				None,
-			)?;
-
-			Ok(())
+		// Mailbox must exist (needed for inbox delivery and the public key), but no policy checks
+		for recipient in recipients.iter() {
+			ensure!(Mailboxes::<T>::contains_key(recipient), Error::<T>::MailboxNotFound);
 		}
+
+		let payload = Self::validate_encrypted_payload(
+			&recipients, encrypted_subject, encrypted_body, encrypted_keys,
+		)?;
+
+		Self::allocate_and_deliver(
+			sender,
+			recipients,
+			payload.subject_hash,
+			payload.encrypted_subject,
+			payload.encrypted_body,
+			payload.encrypted_keys,
+			BoundedVec::default(),   // no attachments
+			thread_parent,
+		)
+	}
 
 		/// Query a recipient's public key for encryption.
 		///

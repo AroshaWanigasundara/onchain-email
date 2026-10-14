@@ -260,6 +260,10 @@ pub mod pallet {
 	/// label). Bounded by [`Config::MaxFolderNameLen`].
 	pub type FolderId<T> = BoundedVec<u8, <T as Config>::MaxFolderNameLen>;
 
+	/// Folders every mailbox relies on (delivery always indexes into `inbox`).
+	/// `delete_folder` refuses to remove them.
+	pub const PROTECTED_FOLDERS: [&[u8]; 3] = [b"inbox", b"sent", b"archive"];
+
 	/// Identifier of a mail item. A simple incrementing counter (see [`NextMailId`]); not
 	/// configurable per-runtime since it carries no domain meaning of its own.
 	pub type MailId = u64;
@@ -563,6 +567,10 @@ pub mod pallet {
 		PolicyUpdated { who: T::AccountId },
 		/// `who` added `blocked` to their blocklist.
 		SenderBlocked { who: T::AccountId, blocked: T::AccountId },
+		/// `who` declared a new folder in their mailbox.
+		FolderCreated { who: T::AccountId, folder: Vec<u8> },
+		/// `who` removed an (empty) folder from their mailbox.
+		FolderDeleted { who: T::AccountId, folder: Vec<u8> },
 	}
 
 	/// Errors that can be returned by this pallet.
@@ -631,6 +639,16 @@ pub mod pallet {
 		PublicKeyRequired,
 		/// The encrypted subject exceeds [`Config::MaxEncryptedSubjectLen`].
 		EncryptedSubjectTooLarge,
+		/// A folder name was empty.
+		EmptyFolderName,
+		/// The mailbox already declares a folder with this name.
+		FolderAlreadyExists,
+		/// The mailbox does not declare a folder with this name.
+		FolderNotFound,
+		/// The folder still holds mail; move or tombstone it first.
+		FolderNotEmpty,
+		/// `inbox`, `sent` and `archive` cannot be deleted.
+		ProtectedFolder,
 	}
 
 	#[pallet::call]
@@ -1039,6 +1057,69 @@ pub mod pallet {
 				sender, recipients, encrypted_subject, encrypted_body, encrypted_keys, thread_parent,
 			)
 			.map(|_| ())
+		}
+
+		/// Declare an additional folder in the caller's existing mailbox. `create_mailbox`
+		/// still declares its initial folders itself; this is for adding more later.
+		#[pallet::call_index(9)]
+		#[pallet::weight(T::WeightInfo::create_folder())]
+		pub fn create_folder(origin: OriginFor<T>, folder: Vec<u8>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			ensure!(!folder.is_empty(), Error::<T>::EmptyFolderName);
+			let folder_id: FolderId<T> = folder
+				.clone()
+				.try_into()
+				.map_err(|_| Error::<T>::FolderNameTooLong)?;
+
+			Mailboxes::<T>::try_mutate(&who, |maybe_config| -> DispatchResult {
+				let config = maybe_config.as_mut().ok_or(Error::<T>::MailboxNotFound)?;
+				ensure!(!config.folders.contains(&folder_id), Error::<T>::FolderAlreadyExists);
+				config
+					.folders
+					.try_push(folder_id.clone())
+					.map_err(|_| Error::<T>::TooManyFolders)?;
+				Ok(())
+			})?;
+
+			Self::deposit_event(Event::FolderCreated { who, folder });
+			Ok(())
+		}
+
+		/// Remove an empty folder from the caller's mailbox. The default folders
+		/// (`inbox`, `sent`, `archive`) are protected, and a folder that still holds mail
+		/// must be emptied first (move or tombstone its mail).
+		#[pallet::call_index(10)]
+		#[pallet::weight(T::WeightInfo::delete_folder())]
+		pub fn delete_folder(origin: OriginFor<T>, folder: Vec<u8>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			ensure!(
+				!PROTECTED_FOLDERS.iter().any(|p| *p == folder.as_slice()),
+				Error::<T>::ProtectedFolder
+			);
+			let folder_id: FolderId<T> = folder
+				.clone()
+				.try_into()
+				.map_err(|_| Error::<T>::FolderNameTooLong)?;
+
+			ensure!(
+				MailboxIndex::<T>::get(&who, &folder_id).is_empty(),
+				Error::<T>::FolderNotEmpty
+			);
+
+			Mailboxes::<T>::try_mutate(&who, |maybe_config| -> DispatchResult {
+				let config = maybe_config.as_mut().ok_or(Error::<T>::MailboxNotFound)?;
+				let pos = config
+					.folders
+					.iter()
+					.position(|f| f == &folder_id)
+					.ok_or(Error::<T>::FolderNotFound)?;
+				config.folders.remove(pos);
+				Ok(())
+			})?;
+			MailboxIndex::<T>::remove(&who, &folder_id);
+
+			Self::deposit_event(Event::FolderDeleted { who, folder });
+			Ok(())
 		}
 		
 	}

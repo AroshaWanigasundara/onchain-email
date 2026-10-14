@@ -1074,3 +1074,119 @@ fn public_key_not_found_for_non_existent_mailbox() {
         assert_eq!(NuMail::get_public_key(&999), None);
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// create_folder / delete_folder
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn create_folder_works() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		open_mailbox(1);
+
+		assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()));
+
+		let folders = Mailboxes::<Test>::get(1).unwrap().folders;
+		assert_eq!(folders.len(), 1);
+		assert_eq!(folders[0].to_vec(), b"work".to_vec());
+		System::assert_last_event(Event::<Test>::FolderCreated { who: 1, folder: b"work".to_vec() }.into());
+	});
+}
+
+#[test]
+fn create_folder_rejects_bad_input() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()),
+			Error::<Test>::MailboxNotFound
+		);
+		open_mailbox(1);
+		assert_noop!(NuMail::create_folder(RuntimeOrigin::signed(1), vec![]), Error::<Test>::EmptyFolderName);
+		assert_noop!(
+			NuMail::create_folder(RuntimeOrigin::signed(1), vec![b'a'; 33]),
+			Error::<Test>::FolderNameTooLong
+		);
+		assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()));
+		assert_noop!(
+			NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()),
+			Error::<Test>::FolderAlreadyExists
+		);
+	});
+}
+
+#[test]
+fn create_folder_respects_max_folders() {
+	new_test_ext().execute_with(|| {
+		open_mailbox(1);
+		// MaxFoldersPerAccount is 16 in the mock.
+		for i in 0..16 {
+			assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(1), format!("f{i}").into_bytes()));
+		}
+		assert_noop!(
+			NuMail::create_folder(RuntimeOrigin::signed(1), b"one-too-many".to_vec()),
+			Error::<Test>::TooManyFolders
+		);
+	});
+}
+
+#[test]
+fn delete_folder_works_including_folders_declared_at_creation() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		assert_ok!(NuMail::create_mailbox(
+			RuntimeOrigin::signed(1),
+			AcceptancePolicy::Open,
+			None,
+			vec![b"inbox".to_vec(), b"projects".to_vec()],
+			mock_public_key(256),
+		));
+		assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()));
+
+		assert_ok!(NuMail::delete_folder(RuntimeOrigin::signed(1), b"projects".to_vec()));
+		assert_ok!(NuMail::delete_folder(RuntimeOrigin::signed(1), b"work".to_vec()));
+
+		let folders = Mailboxes::<Test>::get(1).unwrap().folders;
+		assert_eq!(folders.len(), 1);
+		System::assert_last_event(Event::<Test>::FolderDeleted { who: 1, folder: b"work".to_vec() }.into());
+	});
+}
+
+#[test]
+fn delete_folder_refuses_default_missing_and_unknown() {
+	new_test_ext().execute_with(|| {
+		assert_noop!(
+			NuMail::delete_folder(RuntimeOrigin::signed(1), b"work".to_vec()),
+			Error::<Test>::MailboxNotFound
+		);
+		open_mailbox(1);
+		for name in [&b"inbox"[..], b"sent", b"archive"] {
+			assert_noop!(
+				NuMail::delete_folder(RuntimeOrigin::signed(1), name.to_vec()),
+				Error::<Test>::ProtectedFolder
+			);
+		}
+		assert_noop!(
+			NuMail::delete_folder(RuntimeOrigin::signed(1), b"nope".to_vec()),
+			Error::<Test>::FolderNotFound
+		);
+	});
+}
+
+#[test]
+fn delete_folder_requires_folder_to_be_empty() {
+	new_test_ext().execute_with(|| {
+		let mail_id = send_open_mail(1, 2);
+		assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(2), b"work".to_vec()));
+		assert_ok!(NuMail::move_to_folder(RuntimeOrigin::signed(2), mail_id, b"work".to_vec()));
+
+		assert_noop!(
+			NuMail::delete_folder(RuntimeOrigin::signed(2), b"work".to_vec()),
+			Error::<Test>::FolderNotEmpty
+		);
+
+		// once the mail is moved out, the delete goes through
+		assert_ok!(NuMail::move_to_folder(RuntimeOrigin::signed(2), mail_id, b"inbox".to_vec()));
+		assert_ok!(NuMail::delete_folder(RuntimeOrigin::signed(2), b"work".to_vec()));
+	});
+}

@@ -32,6 +32,8 @@ pub trait WeightInfo {
 	fn block_sender() -> Weight;
 	fn unblock_sender() -> Weight;
 	fn system_notice() -> Weight;
+	fn create_folder() -> Weight;
+	fn delete_folder() -> Weight;
 }
 
 /// Weights for pallet_numail using the Substrate node and recommended hardware.
@@ -141,6 +143,20 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(32_u64))
 			.saturating_add(T::DbWeight::get().writes(32_u64))
 	}
+	
+	/// 1 read + 1 write (Mailboxes try_mutate, O(n) over ≤16 folders).
+	fn create_folder() -> Weight {
+		Weight::from_parts(12_000_000, 0)
+			.saturating_add(T::DbWeight::get().reads(1_u64))
+			.saturating_add(T::DbWeight::get().writes(1_u64))
+	}
+
+	/// 2 reads (MailboxIndex, Mailboxes) + 2 writes (Mailboxes, MailboxIndex remove).
+	fn delete_folder() -> Weight {
+		Weight::from_parts(15_000_000, 0)
+			.saturating_add(T::DbWeight::get().reads(2_u64))
+			.saturating_add(T::DbWeight::get().writes(2_u64))
+	}
 }
 
 // For backwards compatibility and tests (unit testing doesn't use hardware timers).
@@ -171,5 +187,11 @@ impl WeightInfo for () {
 	}
 	fn system_notice() -> Weight {
 		Weight::from_parts(130_000_000, 0)
+	}
+	fn create_folder() -> Weight {
+		Weight::from_parts(12_000_000, 0)
+	}
+	fn delete_folder() -> Weight {
+		Weight::from_parts(15_000_000, 0)
 	}
 }

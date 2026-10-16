@@ -46,6 +46,7 @@ parameter_types! {
 	pub const MaxMailPerFolder: u32 = 256;
 	pub const MaxThreadSize: u32 = 256;
 	pub const MaxBlocklistSize: u32 = 64;
+	pub const MaxExpiriesPerBlock: u32 = 4;
 }
 
 thread_local! {
@@ -167,6 +168,7 @@ impl pallet_numail::Config for Test {
     type MaxEncryptedKeyLen = MaxEncryptedKeyLen;
 	type MaxPublicKeyLen = MaxPublicKeyLen;
 	type MaxEncryptedSubjectLen = MaxEncryptedSubjectLen;
+	type MaxExpiriesPerBlock = MaxExpiriesPerBlock;
 }
 
 // Build genesis storage according to the mock runtime.

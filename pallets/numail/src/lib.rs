@@ -100,6 +100,9 @@ pub mod pallet {
 		fn trust_score(sender: &AccountId) -> u32;
 	}
 
+	/// How many consecutive blocks past the target we try when a block's expiry queue is full.
+	pub const EXPIRY_PROBE_BLOCKS: u32 = 32;
+
 	impl<AccountId> RecipientPolicyProvider<AccountId> for () {
 		fn is_contact(_sender: &AccountId, _recipient: &AccountId) -> bool {
 			false
@@ -222,6 +225,10 @@ pub mod pallet {
 		/// Maximum mail items indexed into a single folder.
 		#[pallet::constant]
 		type MaxMailPerFolder: Get<u32>;
+
+		/// Maximum mail items that may be scheduled for retention-expiry in a single block.
+		#[pallet::constant]
+		type MaxExpiriesPerBlock: Get<u32>;
 
 		/// Maximum mail items tracked in a single conversation thread.
 		#[pallet::constant]
@@ -529,6 +536,17 @@ pub mod pallet {
 	pub type DeliveryState<T: Config> =
 		StorageDoubleMap<_, Blake2_128Concat, MailId, Blake2_128Concat, T::AccountId, DeliveryStatus>;
 
+	/// Retention schedule: `expiry block -> [(mail id, recipient)]`. Filled at delivery time
+	/// from the recipient's `retention_blocks`; drained by `on_initialize`.
+	#[pallet::storage]
+	pub type ExpiryQueue<T: Config> = StorageMap<
+		_,
+		Twox64Concat,
+		BlockNumberFor<T>,
+		BoundedVec<(MailId, T::AccountId), T::MaxExpiriesPerBlock>,
+		ValueQuery,
+	>;
+
 	/// Conversation tree membership: `thread id -> mail ids`, in thread order.
 	#[pallet::storage]
 	pub type Threads<T: Config> = StorageMap<_, Blake2_128Concat, ThreadId, BoundedVec<MailId, T::MaxThreadSize>, ValueQuery>;
@@ -571,6 +589,12 @@ pub mod pallet {
 		FolderCreated { who: T::AccountId, folder: Vec<u8> },
 		/// `who` removed an (empty) folder from their mailbox.
 		FolderDeleted { who: T::AccountId, folder: Vec<u8> },
+		/// A mail item reached its recipient's retention window and was tombstoned
+		/// automatically. The envelope's evidential record is untouched.
+		MailExpired { mail_id: MailId, recipient: T::AccountId },
+		/// The expiry slots around the target block were all full, so this mail was NOT
+		/// scheduled for automatic tombstoning.
+		RetentionNotScheduled { mail_id: MailId, recipient: T::AccountId },
 	}
 
 	/// Errors that can be returned by this pallet.
@@ -649,6 +673,14 @@ pub mod pallet {
 		FolderNotEmpty,
 		/// `inbox`, `sent` and `archive` cannot be deleted.
 		ProtectedFolder,
+	}
+	
+	#[pallet::hooks]
+	impl<T: Config> Hooks<BlockNumberFor<T>> for Pallet<T> {
+		/// Tombstone every mail whose retention window ends in this block.
+		fn on_initialize(now: BlockNumberFor<T>) -> Weight {
+			Self::process_expired_mail(now)
+		}
 	}
 
 	#[pallet::call]
@@ -1176,6 +1208,7 @@ pub mod pallet {
 					.map_err(|_| Error::<T>::FolderFull)?;
 				MailFolderOf::<T>::insert(recipient, mail_id, inbox.clone());
 				DeliveryState::<T>::insert(mail_id, recipient, DeliveryStatus::Delivered);
+				Self::schedule_retention_expiry(mail_id, recipient);
 				Self::deposit_event(Event::MailDelivered { mail_id, recipient: recipient.clone() });
 			}
 
@@ -1194,6 +1227,56 @@ pub mod pallet {
 			});
 
 			Ok(mail_id)
+		}
+
+		/// Schedules `(mail_id, recipient)` for automatic tombstoning if the recipient's mailbox
+		/// has a retention window. Called at delivery time, so the window in force *when the
+		/// mail arrives* is the one that applies to it.
+		fn schedule_retention_expiry(mail_id: MailId, recipient: &T::AccountId) {
+			use frame_support::sp_runtime::traits::{One, Saturating, Zero};
+
+			let Some(retention) = Mailboxes::<T>::get(recipient).and_then(|c| c.retention_blocks) else {
+				return;
+			};
+			if retention.is_zero() {
+				return;
+			}
+			let mut at = frame_system::Pallet::<T>::block_number().saturating_add(retention);
+			for _ in 0..EXPIRY_PROBE_BLOCKS {
+				if ExpiryQueue::<T>::try_mutate(at, |q| q.try_push((mail_id, recipient.clone()))).is_ok() {
+					return;
+				}
+				at = at.saturating_add(One::one()); // this block's queue is full, try the next
+			}
+			Self::deposit_event(Event::RetentionNotScheduled { mail_id, recipient: recipient.clone() });
+		}
+
+		/// Drains this block's expiry queue. Cost is bounded by `MaxExpiriesPerBlock`.
+		fn process_expired_mail(now: BlockNumberFor<T>) -> Weight {
+			let db = T::DbWeight::get();
+			if !ExpiryQueue::<T>::contains_key(now) {
+				return db.reads(1);
+			}
+			let due = ExpiryQueue::<T>::take(now);
+			let mut weight = db.reads_writes(1, 1);
+			for (mail_id, recipient) in due.iter() {
+				weight = weight.saturating_add(T::WeightInfo::tombstone());
+				Self::expire_mail(*mail_id, recipient);
+			}
+			weight
+		}
+
+		/// Same effect as the `tombstone` extrinsic, minus the signed origin.
+		fn expire_mail(mail_id: MailId, recipient: &T::AccountId) {
+			match DeliveryState::<T>::get(mail_id, recipient) {
+				None | Some(DeliveryStatus::Tombstoned) => return, // already gone
+				Some(_) => {}
+			}
+			if let Some(folder) = MailFolderOf::<T>::take(recipient, mail_id) {
+				MailboxIndex::<T>::mutate(recipient, &folder, |ids| ids.retain(|&id| id != mail_id));
+			}
+			DeliveryState::<T>::insert(mail_id, recipient, DeliveryStatus::Tombstoned);
+			Self::deposit_event(Event::MailExpired { mail_id, recipient: recipient.clone() });
 		}
 
 		/// Validates subject/body/key sizes and the per-recipient key set.

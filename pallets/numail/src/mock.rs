@@ -39,7 +39,7 @@ impl frame_system::Config for Test {
 }
 
 parameter_types! {
-	pub const MaxRecipients: u32 = 16;
+	pub const MaxRecipients: u32 = 64;
 	pub const MaxAttachments: u32 = 8;
 	pub const MaxFolderNameLen: u32 = 32;
 	pub const MaxFoldersPerAccount: u32 = 16;

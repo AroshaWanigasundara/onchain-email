@@ -176,6 +176,7 @@ parameter_types! {
     pub const MaxEncryptedKeyLen: u32 = 2048;
 	pub const MaxPublicKeyLen: u32 = 2048;  // 2 KB for RSA public key
 	pub const MaxEncryptedSubjectLen: u32 = 2048;
+	pub const NuMailMaxExpiriesPerBlock: u32 = 256;
 }
  
 /// Configure the pallet-numail in pallets/numail.
@@ -199,4 +200,5 @@ impl pallet_numail::Config for Runtime {
     type MaxEncryptedKeyLen = MaxEncryptedKeyLen;
 	type MaxPublicKeyLen = MaxPublicKeyLen;
 	type MaxEncryptedSubjectLen = MaxEncryptedSubjectLen;
+	type MaxExpiriesPerBlock = NuMailMaxExpiriesPerBlock;
 }

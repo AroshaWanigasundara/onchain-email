@@ -165,7 +165,7 @@ impl pallet_template::Config for Runtime {
 }
 
 parameter_types! {
-	pub const NuMailMaxRecipients: u32 = 16;
+	pub const NuMailMaxRecipients: u32 = 64;
 	pub const NuMailMaxAttachments: u32 = 8;
 	pub const NuMailMaxFolderNameLen: u32 = 32;
 	pub const NuMailMaxFoldersPerAccount: u32 = 16;

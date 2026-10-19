@@ -1,9 +1,10 @@
 use crate::{
 	mock::*, AcceptancePolicy, Blocklists, DeliveryState, DeliveryStatus, Error, Event, FolderId,
 	MailEnvelope, MailItems, MailboxConfig, MailboxIndex, Mailboxes, NextMailId, PostageEscrow,
-	Threads, MailEncryptedKeys,PublicKeys,
+	Threads, MailEncryptedKeys,PublicKeys, MailFolderOf, ExpiryQueue,
 };
 use frame_support::{assert_noop, assert_ok, BoundedVec};
+use frame_support::traits::Hooks;
 
 // ---------------------------------------------------------------------------------------------
 // Phase 2 carry-overs: direct storage round-trips, proving the data model's types/bounds/
@@ -23,6 +24,39 @@ fn mock_encrypted_body(size: usize) -> Vec<u8> {
 /// Mock RSA public key (256 bytes for testing)
 fn mock_public_key(size: usize) -> Vec<u8> {
     vec![0xAB; size]  // Use different byte pattern (0xAB) to distinguish from other mocks
+}
+
+fn run_to_block(n: u64) {
+	while System::block_number() < n {
+		let next = System::block_number() + 1;
+		System::set_block_number(next);
+		NuMail::on_initialize(next);
+	}
+}
+
+/// Account 2 opens a mailbox with `retention`; account 1 sends it one mail.
+fn send_to_retention_mailbox(retention: Option<u64>) -> u64 {
+	assert_ok!(NuMail::create_mailbox(
+		RuntimeOrigin::signed(2),
+		AcceptancePolicy::Open,
+		retention,
+		vec![],
+		mock_public_key(256),
+	));
+	send_one_more()
+}
+
+fn send_one_more() -> u64 {
+	assert_ok!(NuMail::send_mail(
+		RuntimeOrigin::signed(1),
+		vec![2],
+		Default::default(),
+		Default::default(),
+		vec![(2, mock_encrypted_key(256))],
+		vec![],
+		None,
+	));
+	NextMailId::<Test>::get() - 1
 }
 
 #[test]
@@ -140,7 +174,7 @@ fn create_mailbox_fails_if_already_exists() {
 fn create_mailbox_fails_for_folder_name_too_long() {
 	new_test_ext().execute_with(|| {
 		// MaxFolderNameLen is 32 in the mock.
-		let too_long = vec![0u8; 33];
+		let too_long = vec![0u8; 66];
 		assert_noop!(
 			NuMail::create_mailbox(RuntimeOrigin::signed(1), AcceptancePolicy::Open, None, vec![too_long], mock_public_key(256)),
 			Error::<Test>::FolderNameTooLong
@@ -1104,7 +1138,7 @@ fn create_folder_rejects_bad_input() {
 		open_mailbox(1);
 		assert_noop!(NuMail::create_folder(RuntimeOrigin::signed(1), vec![]), Error::<Test>::EmptyFolderName);
 		assert_noop!(
-			NuMail::create_folder(RuntimeOrigin::signed(1), vec![b'a'; 33]),
+			NuMail::create_folder(RuntimeOrigin::signed(1), vec![b'a'; 66]),
 			Error::<Test>::FolderNameTooLong
 		);
 		assert_ok!(NuMail::create_folder(RuntimeOrigin::signed(1), b"work".to_vec()));
@@ -1188,5 +1222,120 @@ fn delete_folder_requires_folder_to_be_empty() {
 		// once the mail is moved out, the delete goes through
 		assert_ok!(NuMail::move_to_folder(RuntimeOrigin::signed(2), mail_id, b"inbox".to_vec()));
 		assert_ok!(NuMail::delete_folder(RuntimeOrigin::signed(2), b"work".to_vec()));
+	});
+}
+
+#[test]
+fn mail_is_tombstoned_when_retention_elapses() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let mail_id = send_to_retention_mailbox(Some(5)); // delivered at 1 -> expires at 6
+
+		run_to_block(5);
+		assert_eq!(DeliveryState::<Test>::get(mail_id, 2), Some(DeliveryStatus::Delivered));
+
+		run_to_block(6);
+		assert_eq!(DeliveryState::<Test>::get(mail_id, 2), Some(DeliveryStatus::Tombstoned));
+		assert!(MailFolderOf::<Test>::get(2, mail_id).is_none());
+		assert!(!MailboxIndex::<Test>::get(2, BoundedVec::try_from(b"inbox".to_vec()).unwrap()).contains(&mail_id));
+		assert!(MailItems::<Test>::get(mail_id).is_some()); // evidential record stays
+		assert!(!ExpiryQueue::<Test>::contains_key(6));
+		System::assert_has_event(Event::<Test>::MailExpired { mail_id, recipient: 2 }.into());
+	});
+}
+
+#[test]
+fn no_retention_means_mail_is_kept() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let mail_id = send_to_retention_mailbox(None);
+		run_to_block(500);
+		assert_eq!(DeliveryState::<Test>::get(mail_id, 2), Some(DeliveryStatus::Delivered));
+	});
+}
+
+#[test]
+fn manually_tombstoned_mail_is_skipped_at_expiry() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let mail_id = send_to_retention_mailbox(Some(5));
+		assert_ok!(NuMail::tombstone(RuntimeOrigin::signed(2), mail_id));
+		run_to_block(6);
+		assert_eq!(DeliveryState::<Test>::get(mail_id, 2), Some(DeliveryStatus::Tombstoned));
+		assert!(!ExpiryQueue::<Test>::contains_key(6));
+	});
+}
+
+#[test]
+fn full_expiry_slot_spills_into_the_next_block() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let first = send_to_retention_mailbox(Some(5));
+		for _ in 0..4 {
+			send_one_more(); // 5 mails, but the mock allows 4 per block
+		}
+		assert_eq!(ExpiryQueue::<Test>::get(6).len(), 4);
+		assert_eq!(ExpiryQueue::<Test>::get(7).len(), 1);
+
+		run_to_block(7);
+		for id in first..first + 5 {
+			assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Tombstoned));
+		}
+	});
+}
+
+fn set_retention(who: u64, retention: Option<u64>) {
+	assert_ok!(NuMail::set_mailbox_policy(RuntimeOrigin::signed(who), AcceptancePolicy::Open, retention));
+}
+
+#[test]
+fn raising_retention_before_expiry_extends_existing_mail() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = send_to_retention_mailbox(Some(5)); // would expire at block 6
+		run_to_block(3);
+		set_retention(2, Some(10)); // now 10 blocks from delivery -> block 11
+
+		run_to_block(6);
+		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Delivered));
+		run_to_block(10);
+		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Delivered));
+		run_to_block(11);
+		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Tombstoned));
+	});
+}
+
+#[test]
+fn removing_retention_keeps_existing_mail() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		let id = send_to_retention_mailbox(Some(5));
+		set_retention(2, None);
+		run_to_block(200);
+		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Delivered));
+	});
+}
+
+#[test]
+fn senders_own_copy_expires_under_the_senders_retention() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		assert_ok!(NuMail::create_mailbox(RuntimeOrigin::signed(1), AcceptancePolicy::Open, Some(5), vec![], mock_public_key(256)));
+		assert_ok!(NuMail::create_mailbox(RuntimeOrigin::signed(2), AcceptancePolicy::Open, None, vec![], mock_public_key(256)));
+		// recipients include the sender, exactly like the frontend's self-wrapped key
+		assert_ok!(NuMail::send_mail(
+			RuntimeOrigin::signed(1),
+			vec![2, 1],
+			Default::default(),
+			Default::default(),
+			vec![(2, mock_encrypted_key(256)), (1, mock_encrypted_key(256))],
+			vec![],
+			None,
+		));
+		let id = NextMailId::<Test>::get() - 1;
+
+		run_to_block(6);
+		assert_eq!(DeliveryState::<Test>::get(id, 1), Some(DeliveryStatus::Tombstoned)); // sender's copy gone
+		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Delivered)); // recipient has no policy
 	});
 }

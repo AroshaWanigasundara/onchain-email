@@ -1229,11 +1229,9 @@ pub mod pallet {
 			Ok(mail_id)
 		}
 
-		/// Schedules `(mail_id, recipient)` for automatic tombstoning if the recipient's mailbox
-		/// has a retention window. Called at delivery time, so the window in force *when the
-		/// mail arrives* is the one that applies to it.
+		/// Delivery-time scheduling: window in force when the mail arrives.
 		fn schedule_retention_expiry(mail_id: MailId, recipient: &T::AccountId) {
-			use frame_support::sp_runtime::traits::{One, Saturating, Zero};
+			use frame_support::sp_runtime::traits::{Saturating, Zero};
 
 			let Some(retention) = Mailboxes::<T>::get(recipient).and_then(|c| c.retention_blocks) else {
 				return;
@@ -1241,12 +1239,19 @@ pub mod pallet {
 			if retention.is_zero() {
 				return;
 			}
-			let mut at = frame_system::Pallet::<T>::block_number().saturating_add(retention);
+			let at = frame_system::Pallet::<T>::block_number().saturating_add(retention);
+			Self::schedule_expiry_at(mail_id, recipient, at);
+		}
+
+		/// Queue `(mail_id, recipient)` at block `at`, spilling forward when a slot is full.
+		fn schedule_expiry_at(mail_id: MailId, recipient: &T::AccountId, mut at: BlockNumberFor<T>) {
+			use frame_support::sp_runtime::traits::{One, Saturating};
+
 			for _ in 0..EXPIRY_PROBE_BLOCKS {
 				if ExpiryQueue::<T>::try_mutate(at, |q| q.try_push((mail_id, recipient.clone()))).is_ok() {
 					return;
 				}
-				at = at.saturating_add(One::one()); // this block's queue is full, try the next
+				at = at.saturating_add(One::one());
 			}
 			Self::deposit_event(Event::RetentionNotScheduled { mail_id, recipient: recipient.clone() });
 		}
@@ -1260,18 +1265,40 @@ pub mod pallet {
 			let due = ExpiryQueue::<T>::take(now);
 			let mut weight = db.reads_writes(1, 1);
 			for (mail_id, recipient) in due.iter() {
-				weight = weight.saturating_add(T::WeightInfo::tombstone());
-				Self::expire_mail(*mail_id, recipient);
+				// a tombstone, or a re-schedule (extra reads + one write), per entry
+				weight = weight
+					.saturating_add(T::WeightInfo::tombstone())
+					.saturating_add(db.reads_writes(2, 1));
+				Self::handle_due_expiry(*mail_id, recipient, now);
 			}
 			weight
 		}
 
-		/// Same effect as the `tombstone` extrinsic, minus the signed origin.
-		fn expire_mail(mail_id: MailId, recipient: &T::AccountId) {
+		/// A scheduled slot has arrived. Retention is re-evaluated against the recipient's
+		/// CURRENT policy, so raising the window extends mail that is already scheduled and
+		/// removing it keeps the mail.
+		fn handle_due_expiry(mail_id: MailId, recipient: &T::AccountId, now: BlockNumberFor<T>) {
+			use frame_support::sp_runtime::traits::{Saturating, Zero};
+
 			match DeliveryState::<T>::get(mail_id, recipient) {
 				None | Some(DeliveryStatus::Tombstoned) => return, // already gone
 				Some(_) => {}
 			}
+			let Some(retention) = Mailboxes::<T>::get(recipient)
+				.and_then(|c| c.retention_blocks)
+				.filter(|r| !r.is_zero())
+			else {
+				return; // the policy was removed since delivery: keep the mail
+			};
+			let Some(envelope) = MailItems::<T>::get(mail_id) else { return };
+
+			let deadline = envelope.created_at.saturating_add(retention);
+			if deadline > now {
+				// the window was raised after delivery: push the deadline out
+				Self::schedule_expiry_at(mail_id, recipient, deadline);
+				return;
+			}
+
 			if let Some(folder) = MailFolderOf::<T>::take(recipient, mail_id) {
 				MailboxIndex::<T>::mutate(recipient, &folder, |ids| ids.retain(|&id| id != mail_id));
 			}

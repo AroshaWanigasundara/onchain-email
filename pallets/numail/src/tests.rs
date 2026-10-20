@@ -1,7 +1,7 @@
 use crate::{
 	mock::*, AcceptancePolicy, Blocklists, DeliveryState, DeliveryStatus, Error, Event, FolderId,
 	MailEnvelope, MailItems, MailboxConfig, MailboxIndex, Mailboxes, NextMailId, PostageEscrow,
-	Threads, MailEncryptedKeys,PublicKeys, MailFolderOf, ExpiryQueue,
+	Threads, MailEncryptedKeys,PublicKeys, MailFolderOf, ExpiryQueue, DisplayNames,
 };
 use frame_support::{assert_noop, assert_ok, BoundedVec};
 use frame_support::traits::Hooks;
@@ -1337,5 +1337,52 @@ fn senders_own_copy_expires_under_the_senders_retention() {
 		run_to_block(6);
 		assert_eq!(DeliveryState::<Test>::get(id, 1), Some(DeliveryStatus::Tombstoned)); // sender's copy gone
 		assert_eq!(DeliveryState::<Test>::get(id, 2), Some(DeliveryStatus::Delivered)); // recipient has no policy
+	});
+}
+
+#[test]
+fn display_name_lifecycle() {
+	new_test_ext().execute_with(|| {
+		System::set_block_number(1);
+		open_mailbox(1);
+		open_mailbox(2);
+		assert_noop!(
+			NuMail::set_display_name(RuntimeOrigin::signed(3), b"Carol".to_vec()),
+			Error::<Test>::MailboxNotFound
+		);
+		assert_ok!(NuMail::set_display_name(RuntimeOrigin::signed(1), b"Alice".to_vec()));
+		assert_eq!(DisplayNames::<Test>::get(1).unwrap().to_vec(), b"Alice".to_vec());
+
+		// unique, case-insensitive
+		assert_noop!(
+			NuMail::set_display_name(RuntimeOrigin::signed(2), b"alice".to_vec()),
+			Error::<Test>::DisplayNameTaken
+		);
+		// renaming frees the old name
+		assert_ok!(NuMail::set_display_name(RuntimeOrigin::signed(1), b"Alice B".to_vec()));
+		assert_ok!(NuMail::set_display_name(RuntimeOrigin::signed(2), b"Alice".to_vec()));
+		// same owner may change the case of their own name
+		assert_ok!(NuMail::set_display_name(RuntimeOrigin::signed(2), b"ALICE".to_vec()));
+
+		assert_ok!(NuMail::clear_display_name(RuntimeOrigin::signed(2)));
+		assert!(DisplayNames::<Test>::get(2).is_none());
+		assert_noop!(NuMail::clear_display_name(RuntimeOrigin::signed(2)), Error::<Test>::NoDisplayName);
+	});
+}
+
+#[test]
+fn display_name_rejects_bad_input() {
+	new_test_ext().execute_with(|| {
+		open_mailbox(1);
+		for bad in [&b"a"[..], b" bob", b"bob ", b"bo<b", b"-bob", "bób".as_bytes()] {
+			assert_noop!(
+				NuMail::set_display_name(RuntimeOrigin::signed(1), bad.to_vec()),
+				Error::<Test>::InvalidDisplayName
+			);
+		}
+		assert_noop!(
+			NuMail::set_display_name(RuntimeOrigin::signed(1), vec![b'a'; 65]),
+			Error::<Test>::DisplayNameTooLong
+		);
 	});
 }

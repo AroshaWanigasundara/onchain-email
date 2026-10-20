@@ -34,6 +34,8 @@ pub trait WeightInfo {
 	fn system_notice() -> Weight;
 	fn create_folder() -> Weight;
 	fn delete_folder() -> Weight;
+	fn set_display_name() -> Weight;
+	fn clear_display_name() -> Weight;
 }
 
 /// Weights for pallet_numail using the Substrate node and recommended hardware.
@@ -157,6 +159,18 @@ impl<T: frame_system::Config> WeightInfo for SubstrateWeight<T> {
 			.saturating_add(T::DbWeight::get().reads(2_u64))
 			.saturating_add(T::DbWeight::get().writes(2_u64))
 	}
+
+	// SubstrateWeight<T>
+	fn set_display_name() -> Weight {
+		Weight::from_parts(18_000_000, 0)
+			.saturating_add(T::DbWeight::get().reads(3_u64))
+			.saturating_add(T::DbWeight::get().writes(3_u64))
+	}
+	fn clear_display_name() -> Weight {
+		Weight::from_parts(12_000_000, 0)
+			.saturating_add(T::DbWeight::get().reads(1_u64))
+			.saturating_add(T::DbWeight::get().writes(2_u64))
+	}
 }
 
 // For backwards compatibility and tests (unit testing doesn't use hardware timers).
@@ -193,5 +207,12 @@ impl WeightInfo for () {
 	}
 	fn delete_folder() -> Weight {
 		Weight::from_parts(15_000_000, 0)
+	}
+	// impl WeightInfo for ()
+	fn set_display_name() -> Weight {
+		 Weight::from_parts(18_000_000, 0) 
+	}
+	fn clear_display_name() -> Weight { 
+		Weight::from_parts(12_000_000, 0) 
 	}
 }

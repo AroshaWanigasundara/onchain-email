@@ -103,6 +103,10 @@ pub mod pallet {
 	/// How many consecutive blocks past the target we try when a block's expiry queue is full.
 	pub const EXPIRY_PROBE_BLOCKS: u32 = 32;
 
+	/// Display names are `MIN_DISPLAY_NAME_LEN..=MaxDisplayNameLen` bytes of ASCII letters, digits,
+	/// space, '.', '_' or '-'; they start with a letter/digit and do not end with a space.
+	pub const MIN_DISPLAY_NAME_LEN: usize = 2;
+
 	impl<AccountId> RecipientPolicyProvider<AccountId> for () {
 		fn is_contact(_sender: &AccountId, _recipient: &AccountId) -> bool {
 			false
@@ -261,6 +265,10 @@ pub mod pallet {
 		/// nonce (12) || ciphertext || tag (16). 512 bytes is plenty for a subject.
 		#[pallet::constant]
 		type MaxEncryptedSubjectLen: Get<u32>;
+
+		/// Maximum length of a published display name, in bytes.
+		#[pallet::constant]
+		type MaxDisplayNameLen: Get<u32>;
 	}
 
 	/// A folder or label name within a mailbox (e.g. "inbox", "sent", "archive", or a custom
@@ -560,6 +568,16 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type PostageEscrow<T: Config> = StorageMap<_, Blake2_128Concat, MailId, PostageBalance>;
 
+	/// Public display name of an account (shown instead of the address in clients).
+	#[pallet::storage]
+	pub type DisplayNames<T: Config> =
+		StorageMap<_, Blake2_128Concat, T::AccountId, BoundedVec<u8, T::MaxDisplayNameLen>, OptionQuery>;
+
+	/// Lower-cased display name -> owner. Makes names unique and gives a reverse lookup.
+	#[pallet::storage]
+	pub type NameOwners<T: Config> =
+		StorageMap<_, Blake2_128Concat, BoundedVec<u8, T::MaxDisplayNameLen>, T::AccountId, OptionQuery>;
+
 	/// Events that functions in this pallet can emit.
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -595,6 +613,10 @@ pub mod pallet {
 		/// The expiry slots around the target block were all full, so this mail was NOT
 		/// scheduled for automatic tombstoning.
 		RetentionNotScheduled { mail_id: MailId, recipient: T::AccountId },
+		/// `who` published (or changed) their display name.
+		DisplayNameSet { who: T::AccountId, name: Vec<u8> },
+		/// `who` removed their display name.
+		DisplayNameCleared { who: T::AccountId },
 	}
 
 	/// Errors that can be returned by this pallet.
@@ -673,6 +695,14 @@ pub mod pallet {
 		FolderNotEmpty,
 		/// `inbox`, `sent` and `archive` cannot be deleted.
 		ProtectedFolder,
+		/// The display name is longer than `MaxDisplayNameLen`.
+		DisplayNameTooLong,
+		/// The display name has characters or a shape that is not allowed.
+		InvalidDisplayName,
+		/// Another account already uses this display name (case-insensitive).
+		DisplayNameTaken,
+		/// The caller has no display name to clear.
+		NoDisplayName,
 	}
 	
 	#[pallet::hooks]
@@ -1153,6 +1183,49 @@ pub mod pallet {
 			Self::deposit_event(Event::FolderDeleted { who, folder });
 			Ok(())
 		}
+
+		/// Publish (or change) the caller's display name. Requires a mailbox. Names are unique.
+		#[pallet::call_index(11)]
+		#[pallet::weight(T::WeightInfo::set_display_name())]
+		pub fn set_display_name(origin: OriginFor<T>, name: Vec<u8>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			ensure!(Mailboxes::<T>::contains_key(&who), Error::<T>::MailboxNotFound);
+			ensure!(name.len() <= T::MaxDisplayNameLen::get() as usize, Error::<T>::DisplayNameTooLong);
+			ensure!(Self::is_valid_display_name(&name), Error::<T>::InvalidDisplayName);
+
+			let key: BoundedVec<u8, T::MaxDisplayNameLen> =
+				Self::name_key(&name).try_into().map_err(|_| Error::<T>::DisplayNameTooLong)?;
+			if let Some(owner) = NameOwners::<T>::get(&key) {
+				ensure!(owner == who, Error::<T>::DisplayNameTaken);
+			}
+			let bounded: BoundedVec<u8, T::MaxDisplayNameLen> =
+				name.clone().try_into().map_err(|_| Error::<T>::DisplayNameTooLong)?;
+
+			// release the previous name
+			if let Some(old) = DisplayNames::<T>::get(&who) {
+				let old_key: BoundedVec<u8, T::MaxDisplayNameLen> =
+					Self::name_key(&old).try_into().map_err(|_| Error::<T>::DisplayNameTooLong)?;
+				NameOwners::<T>::remove(old_key);
+			}
+			NameOwners::<T>::insert(&key, &who);
+			DisplayNames::<T>::insert(&who, bounded);
+
+			Self::deposit_event(Event::DisplayNameSet { who, name });
+			Ok(())
+		}
+
+		/// Remove the caller's display name and free it for others.
+		#[pallet::call_index(12)]
+		#[pallet::weight(T::WeightInfo::clear_display_name())]
+		pub fn clear_display_name(origin: OriginFor<T>) -> DispatchResult {
+			let who = ensure_signed(origin)?;
+			let old = DisplayNames::<T>::take(&who).ok_or(Error::<T>::NoDisplayName)?;
+			let key: BoundedVec<u8, T::MaxDisplayNameLen> =
+				Self::name_key(&old).try_into().map_err(|_| Error::<T>::DisplayNameTooLong)?;
+			NameOwners::<T>::remove(key);
+			Self::deposit_event(Event::DisplayNameCleared { who });
+			Ok(())
+		}
 		
 	}
 
@@ -1366,31 +1439,31 @@ pub mod pallet {
 		encrypted_body: Vec<u8>,
 		encrypted_keys: Vec<(T::AccountId, Vec<u8>)>,
 		thread_parent: Option<MailId>,
-	) -> Result<MailId, DispatchError> {
-		ensure!(!recipients.is_empty(), Error::<T>::NoRecipients);
-		let recipients: BoundedVec<T::AccountId, T::MaxRecipients> =
-			recipients.try_into().map_err(|_| Error::<T>::TooManyRecipients)?;
+		) -> Result<MailId, DispatchError> {
+			ensure!(!recipients.is_empty(), Error::<T>::NoRecipients);
+			let recipients: BoundedVec<T::AccountId, T::MaxRecipients> =
+				recipients.try_into().map_err(|_| Error::<T>::TooManyRecipients)?;
 
-		// Mailbox must exist (needed for inbox delivery and the public key), but no policy checks
-		for recipient in recipients.iter() {
-			ensure!(Mailboxes::<T>::contains_key(recipient), Error::<T>::MailboxNotFound);
+			// Mailbox must exist (needed for inbox delivery and the public key), but no policy checks
+			for recipient in recipients.iter() {
+				ensure!(Mailboxes::<T>::contains_key(recipient), Error::<T>::MailboxNotFound);
+			}
+
+			let payload = Self::validate_encrypted_payload(
+				&recipients, encrypted_subject, encrypted_body, encrypted_keys,
+			)?;
+
+			Self::allocate_and_deliver(
+				sender,
+				recipients,
+				payload.subject_hash,
+				payload.encrypted_subject,
+				payload.encrypted_body,
+				payload.encrypted_keys,
+				BoundedVec::default(),   // no attachments
+				thread_parent,
+			)
 		}
-
-		let payload = Self::validate_encrypted_payload(
-			&recipients, encrypted_subject, encrypted_body, encrypted_keys,
-		)?;
-
-		Self::allocate_and_deliver(
-			sender,
-			recipients,
-			payload.subject_hash,
-			payload.encrypted_subject,
-			payload.encrypted_body,
-			payload.encrypted_keys,
-			BoundedVec::default(),   // no attachments
-			thread_parent,
-		)
-	}
 
 		/// Query a recipient's public key for encryption.
 		///
@@ -1417,6 +1490,19 @@ pub mod pallet {
 		pub fn get_public_key(who: &T::AccountId) -> Option<Vec<u8>> {
 			PublicKeys::<T>::get(who).map(|pk| pk.to_vec())
 		}
-		
+
+		fn is_valid_display_name(name: &[u8]) -> bool {
+			name.len() >= MIN_DISPLAY_NAME_LEN
+				&& name.first().is_some_and(|b| b.is_ascii_alphanumeric())
+				&& name.last().is_some_and(|b| *b != b' ')
+				&& name
+					.iter()
+					.all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'_' | b'-'))
+		}
+
+		/// Uniqueness key: names compare case-insensitively.
+		fn name_key(name: &[u8]) -> Vec<u8> {
+			name.to_ascii_lowercase()
+		}	
 	}
 }
